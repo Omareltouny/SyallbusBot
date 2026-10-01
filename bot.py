@@ -4,15 +4,16 @@ import html
 import subprocess
 import tempfile
 import asyncio
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from pathlib import Path
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from openai import OpenAI
 from google import genai
 
 # ReportLab Imports
 from reportlab.lib.pagesizes import letter
 from reportlab.lib import colors
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, Preformatted
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 
@@ -184,10 +185,26 @@ def build_pdf_from_text(raw_text: str, output_path: str):
         spaceAfter=3
     )
 
+    code_style = ParagraphStyle('CodeBlock', parent=styles['Normal'], fontName='Courier', fontSize=7.5,
+                                leading=9.5, backColor=colors.HexColor('#F1F5F9'), leftIndent=6, spaceAfter=6)
     story = []
+    in_code, code_lines = False, []
 
     for line in raw_text.split('\n'):
         stripped = line.strip()
+        if stripped.startswith('```'):
+            if in_code and code_lines:
+                story.append(Preformatted('\n'.join(code_lines), code_style))
+                code_lines = []
+            in_code = not in_code
+            continue
+        if in_code:
+            ex = line.rstrip().replace('\t', '    ')
+            while len(ex) > 100:
+                code_lines.append(ex[:100])
+                ex = '    ' + ex[100:]
+            code_lines.append(ex)
+            continue
         if not stripped:
             story.append(Spacer(1, 4))
             continue
@@ -236,7 +253,116 @@ def build_pdf_from_text(raw_text: str, output_path: str):
             clean_text = sanitize_for_reportlab(stripped)
             story.append(Paragraph(clean_text, body_style))
 
+    if code_lines:
+        story.append(Preformatted('\n'.join(code_lines), code_style))
     doc.build(story)
+
+# ---------------------------------------------------------------------
+# Assignments / Labs / Tutorials generated from the saved syllabus
+# ---------------------------------------------------------------------
+SYLLABUS_DIR = Path(__file__).parent / "syllabi"   # saved on disk, so restarts lose nothing
+SYLLABUS_DIR.mkdir(exist_ok=True)
+
+DOC_TYPES = {
+    "assignment": ("📝 Assignment", """Write a student Assignment. Title: '# Week {w} Assignment'. Sections:
+## Overview & Learning Objectives
+## Instructions & Submission Format
+## Questions / Tasks (5-6 graded tasks, increasing difficulty, marks per task, total 100)
+## Grading Rubric (table)
+## Model Solutions / Marking Guide"""),
+    "lab": ("💻 Lab", """Write a hands-on Lab Handout. Title: '# Week {w} Lab Handout'. Sections:
+## Learning Objectives
+## Prerequisites & Setup
+## Tasks (numbered, step-by-step, each with an expected deliverable)
+## Starter Code / Template (fenced block: code for CS/Engineering, otherwise a worksheet, proof skeleton, spreadsheet layout or protocol)
+## Grading Rubric (table, total 100)"""),
+    "tutorial": ("📖 Tutorial", """Write a Tutorial Sheet for a tutorial / recitation session. Title: '# Week {w} Tutorial'. Sections:
+## Key Concepts Recap (short)
+## Worked Examples (3, fully solved step by step)
+## Practice Problems (6, increasing difficulty)
+## Solutions to Practice Problems"""),
+}
+
+DOC_SYSTEM_PROMPT = """You are a senior university instructor writing a polished, client-ready teaching document for ONE week of a course.
+Use ONLY the supplied week excerpt and course context; never add unrelated topics. Adapt to the discipline.
+Output clean Markdown only (no HTML tags), starting with a single '# ' title line. Be complete; never write TBD or placeholders."""
+
+WEEK_RE = re.compile(r'^[\s|#>*\-•_]*\**\s*Week\s*0?(\d{1,2})\b', re.IGNORECASE)
+
+
+def extract_week(syllabus: str, week: int) -> str:
+    """Only this week's lines from the syllabus (keeps prompts short and on-topic)."""
+    lines, out, cur = syllabus.split('\n'), [], False
+    for line in lines:
+        m = WEEK_RE.match(line)
+        if m:
+            cur = int(m.group(1)) == week
+            if cur:
+                out.append(line.rstrip())
+        elif line.lstrip().startswith('#') or re.match(r'^[\s#*]*Part\s*\d', line, re.I):
+            cur = False
+        elif cur and line.strip():
+            out.append(line.rstrip())
+    return '\n'.join(out)[:2500] if out else syllabus[:3000]
+
+
+def type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=f"type_{k}") for k, (label, _) in DOC_TYPES.items()]])
+
+
+def week_keyboard(kind: str) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"Week {w}", callback_data=f"gen_{kind}_{w}") for w in range(r, r + 4)] for r in (1, 5, 9)]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data
+    chat_id = q.message.chat_id
+
+    if data.startswith("type_"):
+        kind = data[5:]
+        await q.answer()
+        await q.message.reply_text(f"{DOC_TYPES[kind][0]} - pick a week:", reply_markup=week_keyboard(kind))
+        return
+    if data == "back":
+        await q.answer()
+        await q.message.edit_text("What would you like to generate?", reply_markup=type_keyboard())
+        return
+
+    _, kind, week = data.split("_")
+    week = int(week)
+    path = SYLLABUS_DIR / f"{chat_id}.md"
+    if not path.exists():
+        await q.answer("No syllabus saved yet. Upload a document first.", show_alert=True)
+        return
+    await q.answer()
+    label, task = DOC_TYPES[kind]
+    status = await q.message.reply_text(f"⏳ Generating Week {week} {label[2:]}...")
+    syllabus = path.read_text(encoding="utf-8")
+    prompt = (f"COURSE CONTEXT:\n\"\"\"\n{syllabus[:800]}\n\"\"\"\n\n"
+              f"WEEK {week} SYLLABUS EXCERPT:\n\"\"\"\n{extract_week(syllabus, week)}\n\"\"\"\n\n" + task.format(w=f"{week:02d}"))
+    try:
+        loop = asyncio.get_running_loop()
+        text, _ = await loop.run_in_executor(None, generate_with_fallback, prompt, DOC_SYSTEM_PROMPT)
+        with tempfile.TemporaryDirectory() as tmp:
+            name = f"Week_{week:02d}_{kind.title()}.pdf"
+            out = os.path.join(tmp, name)
+            await loop.run_in_executor(None, build_pdf_from_text, text, out)
+            await status.delete()
+            with open(out, "rb") as f:
+                await context.bot.send_document(chat_id, f, filename=name, caption=f"{label} - Week {week}\nWant another?",
+                                                reply_markup=type_keyboard())
+    except Exception as e:
+        await status.edit_text(f"❌ Failed: {e}")
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not (SYLLABUS_DIR / f"{update.effective_chat.id}.md").exists():
+        await update.message.reply_text("No syllabus yet. Upload a TOC/topic list first.")
+        return
+    await update.message.reply_text("What would you like to generate?", reply_markup=type_keyboard())
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -327,6 +453,7 @@ Text:
             summary_card = full_curriculum[:1200] + "..."
 
         await status_msg.delete()
+        (SYLLABUS_DIR / f"{update.effective_chat.id}.md").write_text(full_curriculum, encoding="utf-8")
 
         # 5. Send clean text preview in chat
         await update.message.reply_text(
@@ -341,12 +468,15 @@ Text:
             await update.message.reply_document(
                 document=f,
                 filename="course_curriculum.pdf",
-                caption="📄 **Accredited 12-Week Course Syllabus (PDF)**\nIncludes full weekly lectures, lab/workshop specs, grading rubric, and instructional blueprints."
+                caption="📄 **Accredited 12-Week Course Syllabus (PDF)**\nIncludes full weekly lectures, lab/workshop specs, grading rubric, and instructional blueprints.\n\nNeed assignments, labs or tutorials for this course? Pick one below:",
+                reply_markup=type_keyboard()
             )
 
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", menu))
+    app.add_handler(CallbackQueryHandler(handle_buttons, pattern=r"^(type_\w+|gen_\w+_\d+|back)$"))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     print("🚀 Universal Syllabus Bot is listening for documents...")
